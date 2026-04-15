@@ -25,7 +25,7 @@ echo "Generating mocks from ${inputfile} to ${outputfile} in package ${package}"
 
 tmp_gen="$(mktemp)"
 year="$(date +"%Y")"
-$(dirname -- "$( readlink -f -- "$0"; )")/../tools/bin/mockgen -source "$(pwd)/${inputfile}" -package "${package}" > "${tmp_gen}"
+$(dirname -- "$( readlink -f -- "$0"; )")/../tools/bin/mockgen -source "$(pwd)/${inputfile}" -package "${package}" | sed "s|$(pwd)/${inputfile}|${inputfile}|g" > "${tmp_gen}"
 mkdir -p $(pwd)/${relativeoutputdir}/
 cat  > "$(pwd)/${relativeoutputdir}/${outputfile}" << EOF
 // Copyright 2023-${year} Amazon.com, Inc. or its affiliates. All Rights Reserved.
