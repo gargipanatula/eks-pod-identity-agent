@@ -60,6 +60,7 @@ func (r *rateLimitedHTTPClient) Do(req *http.Request) (*http.Response, error) {
 type Iface interface {
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
+	String() string
 }
 
 const (
@@ -108,6 +109,8 @@ func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Option
 
 	return s
 }
+
+func (s *service) String() string { return "imds" }
 
 func (s *service) GetIamCredentials(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)

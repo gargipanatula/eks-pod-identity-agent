@@ -67,3 +67,17 @@ func (mr *MockIfaceMockRecorder) GetIamCredentials(ctx, request any) *gomock.Cal
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetIamCredentials", reflect.TypeOf((*MockIface)(nil).GetIamCredentials), ctx, request)
 }
+
+// String mocks base method.
+func (m *MockIface) String() string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "String")
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// String indicates an expected call of String.
+func (mr *MockIfaceMockRecorder) String() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "String", reflect.TypeOf((*MockIface)(nil).String))
+}

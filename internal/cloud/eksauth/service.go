@@ -20,6 +20,7 @@ import (
 type Iface interface {
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
+	String() string
 }
 
 type service struct {
@@ -53,6 +54,8 @@ func (r responseMetadata) AssociationId() string {
 func (r responseMetadata) Source() credentials.CredentialSource {
 	return credentials.SourceAuthService
 }
+
+func (s *service) String() string { return "eks-auth" }
 
 func (s *service) GetIamCredentials(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
