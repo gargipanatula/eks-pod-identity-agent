@@ -19,6 +19,8 @@ type CredentialRetriever interface {
 	// retrieved within the given timeline, this method will error
 	// out
 	GetIamCredentials(ctx context.Context, request *EksCredentialsRequest) (*EksCredentialsResponse, ResponseMetadata, error)
+	// String returns a human-readable name for this retriever (e.g. "imds", "auth-service").
+	String() string
 }
 
 // CredentialSource identifies where credentials were obtained from.
