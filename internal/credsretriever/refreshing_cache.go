@@ -157,6 +157,8 @@ func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCre
 	return retriever
 }
 
+func (r *cachedCredentialRetriever) String() string { return "cached-retriever" }
+
 // GetIamCredentials fetches credentials from the cache if available
 func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
