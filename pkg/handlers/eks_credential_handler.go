@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
+	imdscloud "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
@@ -37,6 +38,7 @@ type EksCredentialHandlerOpts struct {
 	MaxCacheSize       int
 	RefreshQPS         int
 	EndpointOverridden bool
+	EnableIMDS         bool
 }
 
 var (
@@ -47,11 +49,21 @@ var (
 )
 
 func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
-	credentialsRetriever := eksauth.NewService(opts.Cfg)
+	ctx := context.Background()
+	ctx = logger.ContextWithField(ctx, "cluster-name", opts.ClusterName)
+	log := logger.FromContext(ctx)
 
-	tv, err := validation.NewTokenValidator(context.Background())
+	authService := eksauth.NewService(opts.Cfg)
+
+	var imdsSvc credentials.CredentialRetriever
+	if opts.EnableIMDS && imdscloud.ProbeIMDS(ctx, opts.Cfg) {
+		imdsSvc = imdscloud.NewService(ctx, opts.Cfg)
+	}
+
+	delegate := buildCredentialChain(imdsSvc, authService)
+
+	tv, err := validation.NewTokenValidator(ctx)
 	if err != nil {
-		log := logger.FromContext(context.Background())
 		log.Infof("failed to initialize token validator: %v", err)
 	}
 	if tv != nil {
@@ -60,7 +72,7 @@ func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandle
 
 	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {
 		retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
-			Delegate:              credentialsRetriever,
+			Delegate:              delegate,
 			CredentialsRenewalTtl: opts.CredentialRenewal,
 			MaxCacheSize:          opts.MaxCacheSize,
 			RefreshQPS:            opts.RefreshQPS,
@@ -68,14 +80,29 @@ func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandle
 		if tv != nil {
 			retrieverOpts.TokenValidator = tv
 		}
-		credentialsRetriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
+		delegate = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
 	}
 
 	return &EksCredentialHandler{
 		RequestValidator:    validation.DefaultCredentialValidator{},
 		ClusterName:         opts.ClusterName,
-		CredentialRetriever: credentialsRetriever,
+		CredentialRetriever: delegate,
 	}
+}
+
+// buildCredentialChain constructs a delegate chain in order from the provided retrievers,
+// filtering out any nils. If only one retriever remains, it is returned directly.
+func buildCredentialChain(retrievers ...credentials.CredentialRetriever) credentials.CredentialRetriever {
+	var chain []credentials.CredentialRetriever
+	for _, r := range retrievers {
+		if r != nil {
+			chain = append(chain, r)
+		}
+	}
+	if len(chain) == 1 {
+		return chain[0]
+	}
+	return credsretriever.NewChainedRetriever(chain...)
 }
 
 func (h *EksCredentialHandler) ConfigureHandler(register func(pattern string, handlerFunc http.HandlerFunc)) {
