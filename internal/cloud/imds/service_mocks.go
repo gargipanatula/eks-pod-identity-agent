@@ -68,6 +68,21 @@ func (mr *MockIfaceMockRecorder) GetIamCredentials(ctx, request any) *gomock.Cal
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetIamCredentials", reflect.TypeOf((*MockIface)(nil).GetIamCredentials), ctx, request)
 }
 
+// IsIrrecoverable mocks base method.
+func (m *MockIface) IsIrrecoverable(err error) (string, bool) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsIrrecoverable", err)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(bool)
+	return ret0, ret1
+}
+
+// IsIrrecoverable indicates an expected call of IsIrrecoverable.
+func (mr *MockIfaceMockRecorder) IsIrrecoverable(err any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsIrrecoverable", reflect.TypeOf((*MockIface)(nil).IsIrrecoverable), err)
+}
+
 // String mocks base method.
 func (m *MockIface) String() string {
 	m.ctrl.T.Helper()

@@ -11,7 +11,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
-	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
@@ -63,6 +62,25 @@ type cacheEntry struct {
 	requestLogCtx      context.Context
 	originatingRequest *credentials.EksCredentialsRequest
 	credentials        *credentials.EksCredentialsResponse
+	metadata           credentials.ResponseMetadata
+}
+
+// source returns the source of the cache entry, defaulting to eksauth to maintain
+func (e cacheEntry) source() credentials.CredentialSource {
+	if e.metadata == nil {
+		return credentials.SourceAuthService
+	}
+	if s := e.metadata.Source(); s != "" {
+		return s
+	}
+	return credentials.SourceAuthService
+}
+
+func (e cacheEntry) isValid(now time.Time) bool {
+	if e.metadata == nil {
+		return e.credentials.Expiration.Time.After(now)
+	}
+	return e.metadata.IsValid(e.credentials, now)
 }
 
 // internalClock is used to get the current time
@@ -81,7 +99,7 @@ var (
 	promCacheState = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_identity_cache_state",
 		Help: "The state of credential in cache",
-	}, []string{"state"},
+	}, []string{"state", "source"},
 	)
 
 	promLocalValidation = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -100,7 +118,9 @@ const (
 	defaultMinCredentialTtl = 15 * time.Second
 	defaultRetryInterval    = 1 * time.Minute
 	defaultMaxRetryJitter   = 1 * time.Minute
-	renewalTimeout          = 1 * time.Minute
+	// defaultImdsRefreshInterval matches IMDS's 60-minute credential refresh cadence.
+	defaultImdsRefreshInterval = 60 * time.Minute
+	renewalTimeout             = 1 * time.Minute
 )
 
 type CachedCredentialRetrieverOpts struct {
@@ -159,6 +179,10 @@ func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCre
 
 func (r *cachedCredentialRetriever) String() string { return "cached-retriever" }
 
+func (r *cachedCredentialRetriever) IsIrrecoverable(err error) (string, bool) {
+	return r.delegate.IsIrrecoverable(err)
+}
+
 // GetIamCredentials fetches credentials from the cache if available
 func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
@@ -194,7 +218,7 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	defer r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
 
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
-	promCacheState.WithLabelValues("miss").Inc()
+	promCacheState.WithLabelValues("miss", "").Inc()
 
 	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, request)
 	if err != nil {
@@ -205,7 +229,6 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 
 // tryServingFromCache checks the internal cache for valid credentials matching the request.
 // Returns the credentials and true if a cache hit was found, or nil and false otherwise.
-// If the cached entry has expired TTL, it deletes the entry and returns nil, false.
 func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 	podUID string, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, bool) {
 	log := logger.FromContext(ctx)
@@ -215,7 +238,10 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 		return nil, false
 	}
 
-	if _, withinTtl := r.credentialsInEntryWithinValidTtl(val); !withinTtl {
+	// Check whether the cached credentials are still usable according to
+	// the source's own validity policy. The adjusted time incorporates the
+	// cache's minimum TTL floor so each source can decide independently.
+	if !val.isValid(r.now().Add(r.minCredentialTtl)) {
 		log.Info("Identified that entry in cache contains credentials with small ttl or invalid ttl, will be deleted")
 		r.internalCache.Delete(podUID)
 		return nil, false
@@ -224,6 +250,7 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 	// If the cached credentials' token matches the incoming requests' token, return the credentials
 	if val.originatingRequest.ServiceAccountToken == request.ServiceAccountToken {
 		log.WithField("cache-hit", 1).Tracef("Using cached credentials")
+		promCacheState.WithLabelValues("hit", string(val.source())).Inc()
 		return val.credentials, true
 	}
 
@@ -248,6 +275,7 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 	})
 	log.WithField("cache-hit", 1).Tracef("Local validation succeeded, using cached credentials")
 	promLocalValidation.WithLabelValues("success").Inc()
+	promCacheState.WithLabelValues("hit", string(val.source())).Inc()
 	return val.credentials, true
 }
 
@@ -302,25 +330,34 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 		return cacheEntry{}, nil, fmt.Errorf("error getting credentials to cache: %w", err)
 	}
 
-	credsDuration, credentialsValid := r.credentialsInEntryWithinValidTtl(newCacheEntry)
-	if !credentialsValid {
+	source := newCacheEntry.source()
+	now := r.now()
+	credsDuration := newCacheEntry.credentials.Expiration.Time.Sub(now)
+
+	if !newCacheEntry.isValid(now.Add(r.minCredentialTtl)) {
 		return cacheEntry{}, nil, fmt.Errorf("fetched credentials are expired or will expire within the next %0.2f seconds", credsDuration.Seconds())
 	}
 
-	refreshTtl := minDuration(credsDuration, r.credentialsRenewalTtl)
-	log.WithField("refreshTtl", refreshTtl).Infof("Storing creds in cache")
+	refreshTtl, evictionTtl := r.getCacheTtls(source, credsDuration)
+	log.WithField("refreshTtl", refreshTtl).
+		WithField("evictionTtl", evictionTtl).
+		WithField("source", source).
+		Infof("Storing creds in cache")
 
 	// Store credentials in cache if they are valid. It might be that
 	// the credentials might have been either removed or inserted by another
 	// thread, but it won't matter, we'll just upsert as the cache is thread safe
-	r.internalCache.SetWithRefreshExpire(podUID, newCacheEntry, refreshTtl, credsDuration)
-	return newCacheEntry, nil, nil
+	r.internalCache.SetWithRefreshExpire(podUID, newCacheEntry, refreshTtl, evictionTtl)
+	return newCacheEntry, newCacheEntry.metadata, nil
 }
 
-func (r *cachedCredentialRetriever) credentialsInEntryWithinValidTtl(newCacheEntry cacheEntry) (time.Duration, bool) {
-	credsDuration := newCacheEntry.credentials.Expiration.Time.Sub(r.now())
-	credentialsLessThanMinCredTtl := credsDuration > r.minCredentialTtl
-	return credsDuration, credentialsLessThanMinCredTtl
+
+// getCacheTtls returns (refreshTtl, evictionTtl) based on the credential source.
+func (r *cachedCredentialRetriever) getCacheTtls(source credentials.CredentialSource, credsDuration time.Duration) (time.Duration, time.Duration) {
+	if source == credentials.SourceIMDS {
+		return minDuration(defaultImdsRefreshInterval, r.credentialsRenewalTtl), expiring.NoExpiration
+	}
+	return minDuration(credsDuration, r.credentialsRenewalTtl), credsDuration
 }
 
 func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Context,
@@ -329,12 +366,17 @@ func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Con
 	if err != nil {
 		return cacheEntry{}, err
 	}
+	associationID := ""
+	if metadata != nil {
+		associationID = metadata.AssociationId()
+	}
 	requestLogCtx := logger.ContextWithField(logger.CloneToNewIfPresent(ctx, context.Background()),
-		"association-id", metadata.AssociationId())
+		"association-id", associationID)
 	return cacheEntry{
 		originatingRequest: request,
 		requestLogCtx:      requestLogCtx,
 		credentials:        iamCredentials,
+		metadata:           metadata,
 	}, nil
 }
 
@@ -344,7 +386,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 	ctx, cancel := context.WithTimeout(
 		logger.ContextWithField(entry.requestLogCtx, "from", "renewal-thread"), renewalTimeout)
 	defer cancel()
-	log := logger.FromContext(ctx)
+	log := logger.FromContext(ctx).WithField("source", entry.source())
 	if r.refreshRateLimiter.Allow() {
 		err := r.refreshRateLimiter.Wait(ctx)
 		if err != nil {
@@ -354,11 +396,11 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
-			promCacheState.WithLabelValues("hit").Inc()
+			promCacheState.WithLabelValues("hit", string(entry.source())).Inc()
 			return
 		}
 
-		errCode, isIrrecoverableError := eksauth.IsIrrecoverableApiError(err)
+		errCode, isIrrecoverableError := r.delegate.IsIrrecoverable(err)
 		if isIrrecoverableError {
 			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
 			promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
@@ -376,24 +418,37 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		log.Infof("Rate limited! Will try to keep creds locally")
 	}
 
-	// if there was an error, try to keep the old credentials in the agent if they haven't expired
+	// Refresh failed or rate-limited — decide whether to keep old creds and retry.
 	oldCreds := entry.credentials
-	oldCredsDuration := oldCreds.Expiration.Time.Sub(r.now())
-	if oldCredsDuration > r.minCredentialTtl {
-		calculatedRetryInterval := r.retryInterval + time.Duration(rand.Int63n(int64(r.maxRetryJitter)))
-		newRefreshTtl := minDuration(oldCredsDuration, calculatedRetryInterval)
-		log.WithField("ttl", newRefreshTtl).
+	now := r.now()
+	oldCredsDuration := oldCreds.Expiration.Time.Sub(now)
+
+	_, evictionTtl := r.getCacheTtls(entry.source(), oldCredsDuration)
+
+	// Retry cadence depends on source: IMDS retries at its normal refresh
+	// interval, other sources retry quickly capped at remaining lifetime.
+	var retryTtl time.Duration
+	if entry.source() == credentials.SourceIMDS {
+		retryTtl = defaultImdsRefreshInterval + time.Duration(rand.Int63n(int64(r.maxRetryJitter)))
+	} else {
+		retryTtl = r.retryInterval + time.Duration(rand.Int63n(int64(r.maxRetryJitter)))
+		retryTtl = minDuration(oldCredsDuration, retryTtl)
+	}
+
+	// Keep the entry if the credentials are still valid (with the cache's TTL floor applied).
+	if entry.isValid(now.Add(r.minCredentialTtl)) {
+		log.WithField("ttl", retryTtl).
 			Infof("Credentials still valid for at least %0.2fs, keeping them will try again after ttl expires", oldCredsDuration.Seconds())
-		r.internalCache.SetWithRefreshExpire(key, entry, newRefreshTtl, oldCredsDuration)
+		r.internalCache.SetWithRefreshExpire(key, entry, retryTtl, evictionTtl)
 	} else {
 		log.Infof("Evicting credentials since they are too old")
 	}
 }
 
 func (r *cachedCredentialRetriever) onCredentialEviction(key string, entry cacheEntry) {
-	log := logger.FromContext(entry.requestLogCtx)
+	log := logger.FromContext(entry.requestLogCtx).WithField("source", entry.source())
 	log.Infof("Credentials evicted")
-	promCacheState.WithLabelValues("evicted").Inc()
+	promCacheState.WithLabelValues("evicted", string(entry.source())).Inc()
 }
 
 func minDuration(a time.Duration, b time.Duration) time.Duration {

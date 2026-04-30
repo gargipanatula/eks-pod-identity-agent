@@ -48,11 +48,12 @@ func expiredCred(source credentials.CredentialSource) (*credentials.EksCredentia
 
 // stubRetriever is a simple test double for CredentialRetriever.
 type stubRetriever struct {
-	cred   *credentials.EksCredentialsResponse
-	meta   credentials.ResponseMetadata
-	err    error
-	called bool
-	name   string
+	cred          *credentials.EksCredentialsResponse
+	meta          credentials.ResponseMetadata
+	err           error
+	called        bool
+	name          string
+	irrecoverable bool
 }
 
 func (s *stubRetriever) String() string { return s.name }
@@ -61,6 +62,8 @@ func (s *stubRetriever) GetIamCredentials(_ context.Context, _ *credentials.EksC
 	s.called = true
 	return s.cred, s.meta, s.err
 }
+
+func (s *stubRetriever) IsIrrecoverable(_ error) (string, bool) { return "", s.irrecoverable }
 
 func TestChained_SelectionMatrix(t *testing.T) {
 	imdsCred, imdsMeta := unexpiredCred(credentials.SourceIMDS)
@@ -179,6 +182,59 @@ func TestChained_SelectionMatrix(t *testing.T) {
 			require.NotNil(t, cred)
 			assert.Equal(t, tt.wantKey, cred.AccessKeyId)
 			assert.Equal(t, tt.wantSource, meta.Source())
+		})
+	}
+}
+
+func TestChained_ErrorPropagation(t *testing.T) {
+	tests := []struct {
+		name                 string
+		imds                 *stubRetriever
+		auth                 *stubRetriever
+		wantAllIrrecoverable bool
+		wantUnwrapIMDSErr    error // if non-nil, errors.Is(err, this) must be true
+	}{
+		{
+			name:                 "both irrecoverable → wraps ErrAllDelegatesIrrecoverable + both delegate errors",
+			imds:                 &stubRetriever{name: "imds", err: imds.ErrPodNotInMapping, irrecoverable: true},
+			auth:                 &stubRetriever{name: "auth", err: fmt.Errorf("wrapped: %w", &types.AccessDeniedException{}), irrecoverable: true},
+			wantAllIrrecoverable: true,
+			wantUnwrapIMDSErr:    imds.ErrPodNotInMapping,
+		},
+		{
+			name:                 "IMDS irrecoverable + Auth recoverable → NOT ErrAllDelegatesIrrecoverable",
+			imds:                 &stubRetriever{name: "imds", err: imds.ErrPodNotInMapping, irrecoverable: true},
+			auth:                 &stubRetriever{name: "auth", err: fmt.Errorf("wrapped: %w", &types.InternalServerException{}), irrecoverable: false},
+			wantAllIrrecoverable: false,
+			wantUnwrapIMDSErr:    imds.ErrPodNotInMapping,
+		},
+		{
+			name:                 "both recoverable → NOT ErrAllDelegatesIrrecoverable",
+			imds:                 &stubRetriever{name: "imds", err: imds.ErrCredentialNotFound, irrecoverable: false},
+			auth:                 &stubRetriever{name: "auth", err: fmt.Errorf("wrapped: %w", &types.InternalServerException{}), irrecoverable: false},
+			wantAllIrrecoverable: false,
+			wantUnwrapIMDSErr:    imds.ErrCredentialNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chain := NewChainedRetriever(tt.imds, tt.auth)
+			_, _, err := chain.GetIamCredentials(testContext(), testRequest)
+			require.Error(t, err)
+
+			assert.Equal(t, tt.wantAllIrrecoverable, errors.Is(err, ErrAllDelegatesIrrecoverable),
+				"ErrAllDelegatesIrrecoverable mismatch")
+
+			// Verify chain's own IsIrrecoverable agrees with the sentinel
+			_, irrecoverable := chain.IsIrrecoverable(err)
+			assert.Equal(t, tt.wantAllIrrecoverable, irrecoverable,
+				"chain.IsIrrecoverable mismatch")
+
+			// Verify per-delegate errors are unwrappable via errors.Is
+			if tt.wantUnwrapIMDSErr != nil {
+				assert.True(t, errors.Is(err, tt.wantUnwrapIMDSErr), "should unwrap IMDS error")
+			}
 		})
 	}
 }

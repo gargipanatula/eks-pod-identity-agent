@@ -21,6 +21,7 @@ type Iface interface {
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
 	String() string
+	IsIrrecoverable(err error) (string, bool)
 }
 
 type service struct {
@@ -55,7 +56,15 @@ func (r responseMetadata) Source() credentials.CredentialSource {
 	return credentials.SourceAuthService
 }
 
+func (r responseMetadata) IsValid(creds *credentials.EksCredentialsResponse, now time.Time) bool {
+	return creds.Expiration.Time.After(now)
+}
+
 func (s *service) String() string { return "eks-auth" }
+
+func (s *service) IsIrrecoverable(err error) (string, bool) {
+	return IsIrrecoverableApiError(err)
+}
 
 func (s *service) GetIamCredentials(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {

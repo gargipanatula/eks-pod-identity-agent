@@ -21,13 +21,16 @@ type CredentialRetriever interface {
 	GetIamCredentials(ctx context.Context, request *EksCredentialsRequest) (*EksCredentialsResponse, ResponseMetadata, error)
 	// String returns a human-readable name for this retriever (e.g. "imds", "auth-service").
 	String() string
+	// IsIrrecoverable classifies an error returned by this retriever.
+	// Returns a short code for metrics and true when retries will not help.
+	IsIrrecoverable(err error) (string, bool)
 }
 
 // CredentialSource identifies where credentials were obtained from.
 type CredentialSource string
 
 const (
-	SourceAuthService CredentialSource = "auth-service"
+	SourceAuthService CredentialSource = "eks-auth"
 	SourceIMDS        CredentialSource = "imds"
 )
 
@@ -36,6 +39,10 @@ const (
 type ResponseMetadata interface {
 	AssociationId() string
 	Source() CredentialSource
+	// IsValid reports whether the given credentials are still usable.
+	// Each source applies its own policy: e.g. expiration-based, static
+	// stability, or any future scheme.
+	IsValid(creds *EksCredentialsResponse, now time.Time) bool
 }
 
 // CredentialMetadata is a concrete ResponseMetadata for use by
@@ -47,6 +54,15 @@ type CredentialMetadata struct {
 
 func (m CredentialMetadata) AssociationId() string    { return m.Association }
 func (m CredentialMetadata) Source() CredentialSource { return m.CredSource }
+
+// IsValid for IMDS credentials always returns true (static-stability
+// guarantee). For other sources it falls back to expiration checking.
+func (m CredentialMetadata) IsValid(creds *EksCredentialsResponse, now time.Time) bool {
+	if m.CredSource == SourceIMDS {
+		return true
+	}
+	return creds.Expiration.Time.After(now)
+}
 
 // NamespaceInfo represents the parsed info file from an IMDS iam-eks namespace.
 type NamespaceInfo struct {

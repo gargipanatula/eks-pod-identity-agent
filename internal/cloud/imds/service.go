@@ -25,6 +25,7 @@ package imds
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -61,6 +62,7 @@ type Iface interface {
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
 	String() string
+	IsIrrecoverable(err error) (string, bool)
 }
 
 const (
@@ -112,6 +114,32 @@ func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Option
 
 func (s *service) String() string { return "imds" }
 
+func (s *service) IsIrrecoverable(err error) (string, bool) {
+	// IsIrrecoverable is called by the cache to decide whether to evict a
+	// credential entry after a failed refresh.
+	//
+	// ErrPodNotInMapping (irrecoverable): the pod was not found in the
+	// agent's namespaceMapping. The mapping is refreshed every 60s in the
+	// background, and credentials are delivered to IMDS within ~15 minutes
+	// of pod creation. By the time a cache entry is eligible for refresh
+	// (hours), the mapping has long since converged. If the pod is absent
+	// at refresh time, it has genuinely been deleted or its association
+	// removed — eviction is correct.
+	//
+	// ErrCredentialNotFound (recoverable): the pod IS in the mapping but
+	// IMDS returned 404 for the credential itself. This can happen
+	// transiently when credentials are reshuffled across IMDS namespaces.
+	// The mapping still knows about the pod, so a subsequent refresh after
+	// the reshuffle completes will succeed — eviction would be premature.
+	//
+	// All other errors (network timeouts, rate limits, etc.) are transient
+	// and recoverable by definition.
+	if errors.Is(err, ErrPodNotInMapping) {
+		return "PodNotInMapping", true
+	}
+	return "Unknown", false
+}
+
 func (s *service) GetIamCredentials(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)
 
@@ -122,6 +150,18 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 
 	ns, found := s.lookupNamespace(podUID)
 	if !found {
+		// The namespace mapping is refreshed in the background every 60s and
+		// is not refreshed on demand here. A miss means the pod's credentials
+		// were delivered to IMDS between background refresh cycles. On-demand
+		// refresh could close this race, but would need a cooldown to prevent
+		// bursty workloads from hitting the IMDS rate limit — and delivery
+		// during that cooldown recreates the same gap. Background-only refresh
+		// is simpler and bounds IMDS call volume predictably.
+		//
+		// This scenario is unlikely: it requires the agent to restart in the
+		// narrow window between a pod first receiving credentials via the sync
+		// path and those credentials being placed into IMDS. When wired behind
+		// a chained retriever, the retriever will fallback to eksauth.
 		return nil, nil, ErrPodNotInMapping
 	}
 
