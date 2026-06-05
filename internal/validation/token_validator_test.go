@@ -44,6 +44,10 @@ func (c *channelJWKSProvider) fetchPublicKeysWithFallback(ctx context.Context, c
 	return jwks, nil
 }
 
+func (c *channelJWKSProvider) checkK8sVersion(_ context.Context) error {
+	return nil
+}
+
 // rsaJWK builds a JWK entry from an RSA public key, used to populate mock JWKS responses.
 func rsaJWK(kid string, pub *rsa.PublicKey) JWK {
 	return JWK{
@@ -540,11 +544,31 @@ func (f *failingJWKSProvider) fetchPublicKeysWithFallback(ctx context.Context, c
 	return cached, nil
 }
 
+func (f *failingJWKSProvider) checkK8sVersion(_ context.Context) error {
+	return nil
+}
+
 // versionFailingJWKSProvider simulates a version check failure — no disk fallback.
 type versionFailingJWKSProvider struct{}
 
 func (v *versionFailingJWKSProvider) fetchPublicKeysWithFallback(_ context.Context, _ string) (*JWKSet, error) {
 	return nil, fmt.Errorf("%w: apiserver is on version 1.33", ErrUnsupportedK8sVersion)
+}
+
+func (v *versionFailingJWKSProvider) checkK8sVersion(_ context.Context) error {
+	return fmt.Errorf("%w: apiserver is on version 1.33", ErrUnsupportedK8sVersion)
+}
+
+func TestValidateToken_VersionCheckFailure(t *testing.T) {
+	g := NewWithT(t)
+	tv := &TokenValidator{jwksSource: &versionFailingJWKSProvider{}}
+	tv.keys.Store(make(keyCache))
+
+	err := tv.ValidateToken(context.Background(), &credentials.EksCredentialsRequest{
+		ServiceAccountToken: "some-token",
+	})
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("version check failed"))
 }
 
 // TestRefreshKeys_DiskPersistence covers all interactions between refreshKeys and the
@@ -765,4 +789,99 @@ func TestIntegration_AgentRestart_ApiserverDown_ValidatesFromDiskCache(t *testin
 		ServiceAccountToken: token,
 	})
 	g.Expect(err).ToNot(HaveOccurred())
+}
+
+// panicJWKSProvider panics when fetchPublicKeysWithFallback is called,
+// simulating an unexpected crash in the JWKS fetch path.
+type panicJWKSProvider struct{}
+
+func (p *panicJWKSProvider) fetchPublicKeysWithFallback(_ context.Context, _ string) (*JWKSet, error) {
+	panic("unexpected nil pointer in JWKS fetch")
+}
+
+func (p *panicJWKSProvider) checkK8sVersion(_ context.Context) error {
+	return nil
+}
+
+// TestValidateToken_PanicRecovery verifies that a panic anywhere in the
+// local validation path is recovered gracefully and returns an error
+// instead of crashing the goroutine.
+func TestValidateToken_PanicRecovery(t *testing.T) {
+	g := NewWithT(t)
+	now := time.Now()
+	signingKey := test.GenerateTestKey(t)
+
+	// Token with an unknown kid — forces a key refresh, which will panic
+	token := test.CreateSignedToken(t, signingKey, test.TokenConfig{
+		Expiry:          now.Add(time.Hour),
+		Iat:             now,
+		Nbf:             now,
+		HeaderOverrides: map[string]interface{}{"kid": "0000000000000000000000000000000000000001"},
+		Overrides: map[string]interface{}{
+			"aud":           expectedAudience,
+			"sub":           "system:serviceaccount:default:my-sa",
+			"kubernetes.io": fullK8sClaim(),
+		},
+	})
+
+	tv := &TokenValidator{jwksSource: &panicJWKSProvider{}}
+	tv.keys.Store(make(keyCache)) // empty cache — kid miss triggers refresh → panic
+
+	err := tv.ValidateToken(context.Background(), &credentials.EksCredentialsRequest{
+		ServiceAccountToken: token,
+	})
+
+	// Must return an error, not crash
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("panicked"))
+}
+
+// TestValidateToken_KidNotInJWKSAfterRefresh verifies that when the token's kid
+// is not in the PIA's cache and the apiserver returns keys that don't include
+// that kid, ValidateToken returns an error (triggering fallback to Auth Service).
+func TestValidateToken_KidNotInJWKSAfterRefresh(t *testing.T) {
+	g := NewWithT(t)
+	now := time.Now()
+
+	signingKey := test.GenerateTestKey(t)
+	otherKey := test.GenerateTestKey(t)
+
+	// Token signed with a kid that the apiserver won't return
+	tokenKid := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	token := test.CreateSignedToken(t, signingKey, test.TokenConfig{
+		Expiry:          now.Add(time.Hour),
+		Iat:             now,
+		Nbf:             now,
+		HeaderOverrides: map[string]interface{}{"kid": tokenKid},
+		Overrides: map[string]interface{}{
+			"aud":           expectedAudience,
+			"sub":           "system:serviceaccount:default:my-sa",
+			"kubernetes.io": fullK8sClaim(),
+		},
+	})
+
+	// Apiserver returns a different kid — simulates stale/rotated keys
+	provider := &channelJWKSProvider{
+		called: make(chan struct{}, 1),
+		jwks:   &JWKSet{Keys: []JWK{rsaJWK("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &otherKey.PublicKey)}},
+	}
+
+	tv := &TokenValidator{jwksSource: provider}
+	tv.keys.Store(make(keyCache)) // empty cache
+
+	err := tv.ValidateToken(context.Background(), &credentials.EksCredentialsRequest{
+		ServiceAccountToken: token,
+	})
+
+	// Refresh was triggered but kid still not found → error
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("no matching key found"))
+
+	// Confirm refresh was actually called
+	select {
+	case <-provider.called:
+		// expected
+	default:
+		t.Fatal("expected JWKS refresh to be triggered")
+	}
 }

@@ -16,6 +16,7 @@ import (
 // swapped for testing.
 type jwksProvider interface {
 	fetchPublicKeysWithFallback(ctx context.Context, cachePath string) (*JWKSet, error)
+	checkK8sVersion(ctx context.Context) error
 }
 
 type keyCache map[string]*cachedKey
@@ -68,11 +69,24 @@ func (tv *TokenValidator) RefreshKeys(ctx context.Context, token string) error {
 
 // ValidateToken performs claims validation and cryptographic signature
 // verification on the request's service account token.
-func (tv *TokenValidator) ValidateToken(ctx context.Context, req *credentials.EksCredentialsRequest) error {
+func (tv *TokenValidator) ValidateToken(ctx context.Context, req *credentials.EksCredentialsRequest) (err error) {
 	log := logger.FromContext(ctx)
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("panic during local token validation: %v", r)
+			err = fmt.Errorf("local validation panicked: %v", r)
+		}
+	}()
 
 	if req.ServiceAccountToken == "" {
 		return pkgerrors.NewRequestValidationError("Service account token cannot be empty")
+	}
+
+	if tv.jwksSource != nil {
+		if err := tv.jwksSource.checkK8sVersion(ctx); err != nil {
+			return fmt.Errorf("version check failed, skipping local validation: %w", err)
+		}
 	}
 
 	parsedToken, _, err := jwt.NewParser().ParseUnverified(req.ServiceAccountToken, jwt.MapClaims{})
