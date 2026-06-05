@@ -233,7 +233,7 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 		return nil, false
 	}
 
-	// Validate the token 
+	// Validate the token
 	if err := tv.ValidateToken(ctx, request); err != nil {
 		log.Infof("Local token validation failed: %v, falling back to delegate", err)
 		promLocalValidation.WithLabelValues("failure").Inc()
