@@ -2,6 +2,7 @@ package credsretriever
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -20,9 +21,17 @@ var promChainedResult = promauto.NewCounterVec(prometheus.CounterOpts{
 // expirationSkew is the buffer subtracted from credential expiration to account for clock skew.
 const expirationSkew = 5 * time.Minute
 
+// ErrAllDelegatesIrrecoverable is returned from chainedRetriever.GetIamCredentials
+// when every delegate failed and each failure is irrecoverable per that
+// delegate's own classifier.
+var ErrAllDelegatesIrrecoverable = errors.New("chained retriever: all delegates returned irrecoverable errors")
+
 // chainedRetriever tries delegates in order and returns the first unexpired credential.
 // If only expired credentials are available, the topmost (first) is returned.
-// If no delegate returns a credential, the last error is returned.
+// If no delegate returns a credential, the joined errors from all delegates are returned.
+// If no delegate returns a credential and every delegate's error is irrecoverable
+// per its own IsIrrecoverable classifier, the returned error wraps
+// ErrAllDelegatesIrrecoverable.
 type chainedRetriever struct {
 	delegates []credentials.CredentialRetriever
 }
@@ -36,6 +45,15 @@ func NewChainedRetriever(delegates ...credentials.CredentialRetriever) credentia
 
 func (c *chainedRetriever) String() string { return "chained-retriever" }
 
+// IsIrrecoverable returns true if the error wraps ErrAllDelegatesIrrecoverable,
+// meaning every delegate in the chain classified its own error as irrecoverable.
+func (c *chainedRetriever) IsIrrecoverable(err error) (string, bool) {
+	if errors.Is(err, ErrAllDelegatesIrrecoverable) {
+		return "AllDelegatesIrrecoverable", true
+	}
+	return "Unknown", false
+}
+
 func (c *chainedRetriever) GetIamCredentials(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)
@@ -43,7 +61,8 @@ func (c *chainedRetriever) GetIamCredentials(ctx context.Context,
 	var bestCred *credentials.EksCredentialsResponse
 	var bestMeta credentials.ResponseMetadata
 	var bestDelegate string
-	var lastErr error
+	var delegateErrs []error
+	allIrrecoverable := true
 
 	for _, d := range c.delegates {
 		if d == nil {
@@ -54,7 +73,10 @@ func (c *chainedRetriever) GetIamCredentials(ctx context.Context,
 		// Delegate failed — log and try the next one.
 		if err != nil {
 			log.WithFields(logrus.Fields{"delegate": d.String(), "error": err}).Warn("Delegate error, trying next")
-			lastErr = err
+			delegateErrs = append(delegateErrs, err)
+			if _, irrecoverable := d.IsIrrecoverable(err); !irrecoverable {
+				allIrrecoverable = false
+			}
 			continue
 		}
 
@@ -71,7 +93,6 @@ func (c *chainedRetriever) GetIamCredentials(ctx context.Context,
 			bestMeta = meta
 			bestDelegate = d.String()
 		}
-		lastErr = nil
 	}
 
 	if bestCred != nil {
@@ -80,5 +101,11 @@ func (c *chainedRetriever) GetIamCredentials(ctx context.Context,
 		return bestCred, bestMeta, nil
 	}
 
-	return nil, credentials.CredentialMetadata{}, fmt.Errorf("chained retriever: all delegates failed: %w", lastErr)
+	// No credential from any delegate. Return error(s).
+	joined := errors.Join(delegateErrs...)
+	if len(delegateErrs) > 0 && allIrrecoverable {
+		return nil, credentials.CredentialMetadata{}, fmt.Errorf("%w: %w", ErrAllDelegatesIrrecoverable, joined)
+	}
+
+	return nil, credentials.CredentialMetadata{}, fmt.Errorf("chained retriever: all delegates failed: %w", joined)
 }

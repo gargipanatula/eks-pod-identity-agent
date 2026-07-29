@@ -164,6 +164,7 @@ func TestBuildCredentialChain_IMDSPresent_ReturnsIMDSThenFallsBack(t *testing.T)
 	mockIMDS2.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
 		Return(nil, nil, imds.ErrPodNotInMapping)
 	mockIMDS2.EXPECT().String().Return("imds").AnyTimes()
+	mockIMDS2.EXPECT().IsIrrecoverable(gomock.Any()).Return("PodNotInMapping", true).AnyTimes()
 	mockAuth2.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
 		Return(authCred, credentials.CredentialMetadata{Association: "a-1", CredSource: credentials.SourceAuthService}, nil)
 	mockAuth2.EXPECT().String().Return("auth").AnyTimes()

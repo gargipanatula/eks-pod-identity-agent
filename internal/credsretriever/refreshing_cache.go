@@ -11,7 +11,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
-	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
@@ -158,6 +157,11 @@ func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCre
 }
 
 func (r *cachedCredentialRetriever) String() string { return "cached-retriever" }
+
+// IsIrrecoverable delegates error classification to the underlying delegate.
+func (r *cachedCredentialRetriever) IsIrrecoverable(err error) (string, bool) {
+	return r.delegate.IsIrrecoverable(err)
+}
 
 // GetIamCredentials fetches credentials from the cache if available
 func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
@@ -358,7 +362,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			return
 		}
 
-		errCode, isIrrecoverableError := eksauth.IsIrrecoverableApiError(err)
+		errCode, isIrrecoverableError := r.delegate.IsIrrecoverable(err)
 		if isIrrecoverableError {
 			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
 			promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
