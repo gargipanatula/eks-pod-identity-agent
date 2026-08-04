@@ -2,6 +2,7 @@ package credsretriever
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"testing"
@@ -356,6 +357,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_Refresh(t *testing.T) {
 					delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
 						Return(nil, responseMetadataTest("test"), fmt.Errorf("error directed at cache")).MinTimes(2),
 				)
+				delegate.EXPECT().IsIrrecoverable(gomock.Any()).Return("Unknown", false).AnyTimes()
 			},
 			expectedCredentials: longDurationCreds,
 		},
@@ -379,6 +381,13 @@ func TestCachedCredentialRetriever_GetIamCredentials_Refresh(t *testing.T) {
 					delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
 						Return(nil, nil, fmt.Errorf("error directed at second call")).Times(1),
 				)
+				delegate.EXPECT().IsIrrecoverable(gomock.Any()).DoAndReturn(func(err error) (string, bool) {
+					var ade *types.AccessDeniedException
+					if errors.As(err, &ade) {
+						return "AccessDeniedException", true
+					}
+					return "Unknown", false
+				}).AnyTimes()
 			},
 			expectedErrMsg: "error directed at second call",
 		},
@@ -400,6 +409,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_Refresh(t *testing.T) {
 						Return(nil, nil, &types.InternalServerException{}).
 						MinTimes(2),
 				)
+				delegate.EXPECT().IsIrrecoverable(gomock.Any()).Return("Unknown", false).AnyTimes()
 			},
 			expectedCredentials: longDurationCreds,
 		},
@@ -422,6 +432,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_Refresh(t *testing.T) {
 					delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
 						Return(nil, nil, fmt.Errorf("error directed at second call")).Times(1),
 				)
+				delegate.EXPECT().IsIrrecoverable(gomock.Any()).Return("Unknown", false).AnyTimes()
 			},
 			expectedErrMsg: "error directed at second call",
 			timerBuilder: func(counter *int) internalClock {
@@ -664,6 +675,7 @@ func TestCachedCredentialRetriever_OnCredentialRenewal_MissingPodUID(t *testing.
 	defer ctrl.Finish()
 
 	mockDelegate := mockcreds.NewMockCredentialRetriever(ctrl)
+	mockDelegate.EXPECT().IsIrrecoverable(gomock.Any()).Return("Unknown", false).AnyTimes()
 	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
 		Delegate:              mockDelegate,
 		CredentialsRenewalTtl: time.Hour,
