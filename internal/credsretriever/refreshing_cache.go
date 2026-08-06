@@ -62,6 +62,16 @@ type cacheEntry struct {
 	requestLogCtx      context.Context
 	originatingRequest *credentials.EksCredentialsRequest
 	credentials        *credentials.EksCredentialsResponse
+	metadata           credentials.ResponseMetadata
+}
+
+// source returns the credential source for this cache entry, defaulting to
+// SourceAuthService
+func (e cacheEntry) source() credentials.CredentialSource {
+	if e.metadata == nil {
+		return credentials.SourceAuthService
+	}
+	return e.metadata.Source()
 }
 
 // internalClock is used to get the current time
@@ -100,6 +110,10 @@ const (
 	defaultRetryInterval    = 1 * time.Minute
 	defaultMaxRetryJitter   = 1 * time.Minute
 	renewalTimeout          = 1 * time.Minute
+
+	// A new set of credentials are placed in IMDS every ~30 minutes, so IMDS
+	// creds should refresh as often.
+	imdsRefreshInterval = 30 * time.Minute
 )
 
 type CachedCredentialRetrieverOpts struct {
@@ -209,7 +223,6 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 
 // tryServingFromCache checks the internal cache for valid credentials matching the request.
 // Returns the credentials and true if a cache hit was found, or nil and false otherwise.
-// If the cached entry has expired TTL, it deletes the entry and returns nil, false.
 func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 	podUID string, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, bool) {
 	log := logger.FromContext(ctx)
@@ -306,25 +319,55 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 		return cacheEntry{}, nil, fmt.Errorf("error getting credentials to cache: %w", err)
 	}
 
+	if newCacheEntry.credentials == nil {
+		return cacheEntry{}, nil, fmt.Errorf("delegate returned nil credentials")
+	}
+
 	credsDuration, credentialsValid := r.credentialsInEntryWithinValidTtl(newCacheEntry)
 	if !credentialsValid {
 		return cacheEntry{}, nil, fmt.Errorf("fetched credentials are expired or will expire within the next %0.2f seconds", credsDuration.Seconds())
 	}
 
-	refreshTtl := minDuration(credsDuration, r.credentialsRenewalTtl)
-	log.WithField("refreshTtl", refreshTtl).Infof("Storing creds in cache")
+	refreshTtl, evictionTtl := r.getCacheTtls(newCacheEntry.source(), credsDuration)
+	log.WithFields(map[string]interface{}{
+		"refreshTtl":    refreshTtl,
+		"evictionTtl":   evictionTtl,
+		"credsDuration": credsDuration,
+		"source":        newCacheEntry.source(),
+		"podUID":        podUID,
+	}).Infof("Storing creds in cache")
 
 	// Store credentials in cache if they are valid. It might be that
 	// the credentials might have been either removed or inserted by another
 	// thread, but it won't matter, we'll just upsert as the cache is thread safe
-	r.internalCache.SetWithRefreshExpire(podUID, newCacheEntry, refreshTtl, credsDuration)
-	return newCacheEntry, nil, nil
+	r.internalCache.SetWithRefreshExpire(podUID, newCacheEntry, refreshTtl, evictionTtl)
+	return newCacheEntry, newCacheEntry.metadata, nil
 }
 
-func (r *cachedCredentialRetriever) credentialsInEntryWithinValidTtl(newCacheEntry cacheEntry) (time.Duration, bool) {
-	credsDuration := newCacheEntry.credentials.Expiration.Time.Sub(r.now())
-	credentialsLessThanMinCredTtl := credsDuration > r.minCredentialTtl
-	return credsDuration, credentialsLessThanMinCredTtl
+// credentialsInEntryWithinValidTtl reports whether the given cache entry's credentials
+// are still usable, returning both the remaining credential duration and a
+// validity boolean. The policy is source-specific and owned by the cache:
+//   - IMDS: always valid (static-stability guarantee — never evict on expiry).
+//     Duration returned is imdsRefreshInterval (actual expiry may be negative).
+//   - Auth Service/Default: remaining TTL must exceed minCredentialTtl.
+func (r *cachedCredentialRetriever) credentialsInEntryWithinValidTtl(entry cacheEntry) (time.Duration, bool) {
+	if entry.source() == credentials.SourceIMDS {
+		return imdsRefreshInterval, true
+	}
+	// Default: Auth Service policy — credentials must have remaining TTL > minCredentialTtl.
+	credsDuration := entry.credentials.Expiration.Time.Sub(r.now())
+	return credsDuration, credsDuration > r.minCredentialTtl
+}
+
+// getCacheTtls returns per-source refresh and eviction TTLs.
+func (r *cachedCredentialRetriever) getCacheTtls(source credentials.CredentialSource, credsDuration time.Duration) (refresh, eviction time.Duration) {
+	// IMDS credentials have static-stability guarantees. Even if expired, static-stability may
+	// be enabled, so the credentials should still be honored. Hence, they are treated as having
+	// no expiration.
+	if source == credentials.SourceIMDS {
+		return imdsRefreshInterval, expiring.NoExpiration
+	}
+	return minDuration(credsDuration, r.credentialsRenewalTtl), credsDuration
 }
 
 func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Context,
@@ -339,6 +382,7 @@ func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Con
 		originatingRequest: request,
 		requestLogCtx:      requestLogCtx,
 		credentials:        iamCredentials,
+		metadata:           metadata,
 	}, nil
 }
 
@@ -381,14 +425,27 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 	}
 
 	// if there was an error, try to keep the old credentials in the agent if they haven't expired
-	oldCreds := entry.credentials
-	oldCredsDuration := oldCreds.Expiration.Time.Sub(r.now())
-	if oldCredsDuration > r.minCredentialTtl {
+	credsDuration, valid := r.credentialsInEntryWithinValidTtl(entry)
+	if valid {
 		calculatedRetryInterval := r.retryInterval + time.Duration(rand.Int63n(int64(r.maxRetryJitter)))
-		newRefreshTtl := minDuration(oldCredsDuration, calculatedRetryInterval)
-		log.WithField("ttl", newRefreshTtl).
-			Infof("Credentials still valid for at least %0.2fs, keeping them will try again after ttl expires", oldCredsDuration.Seconds())
-		r.internalCache.SetWithRefreshExpire(key, entry, newRefreshTtl, oldCredsDuration)
+
+		var newRefreshTtl, newEvictionTtl time.Duration
+		if entry.source() == credentials.SourceIMDS {
+			newRefreshTtl = calculatedRetryInterval
+			newEvictionTtl = expiring.NoExpiration
+		} else {
+			newRefreshTtl = minDuration(credsDuration, calculatedRetryInterval)
+			newEvictionTtl = credsDuration
+		}
+
+		log.WithFields(map[string]interface{}{
+			"refreshTtl":    newRefreshTtl,
+			"evictionTtl":   newEvictionTtl,
+			"credsDuration": credsDuration,
+			"source":        entry.source(),
+			"podUID":        key,
+		}).Infof("Credentials still valid, keeping them — will try again after refresh ttl")
+		r.internalCache.SetWithRefreshExpire(key, entry, newRefreshTtl, newEvictionTtl)
 	} else {
 		log.Infof("Evicting credentials since they are too old")
 	}
