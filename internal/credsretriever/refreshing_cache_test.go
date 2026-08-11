@@ -1360,3 +1360,141 @@ func TestCachedCredentialRetriever_OnCredentialRenewal_SourceAware(t *testing.T)
 		g.Expect(updated.credentials.AccessKeyId).To(Equal("AKIA-fresh"))
 	})
 }
+
+// TestCachedCredentialRetriever_CombinedEviction exercises the eviction decision
+// end-to-end using a REAL chainedRetriever as the cache's delegate. This validates
+// that the sentinel error (ErrAllDelegatesIrrecoverable) produced by the chain
+// correctly drives the cache's eviction logic without any special-case code in
+// onCredentialRenewal.
+//
+// Matrix:
+//   - Auth irrecoverable + IMDS absent → chain returns ErrAllDelegatesIrrecoverable → evict
+//   - Auth irrecoverable + IMDS has cred → chain returns IMDS cred → keep (renewed)
+//   - Auth recoverable + IMDS absent → chain error is NOT sentinel → keep (retry later)
+//   - Auth recoverable + IMDS has cred → chain returns IMDS cred → keep (renewed)
+func TestCachedCredentialRetriever_CombinedEviction(t *testing.T) {
+	irrecoverableAuthErr := fmt.Errorf("auth irrecoverable")
+	recoverableAuthErr := fmt.Errorf("auth recoverable")
+	imdsAbsentErr := fmt.Errorf("pod not in mapping")
+
+	imdsCred := &credentials.EksCredentialsResponse{
+		AccessKeyId: "AKIA-imds",
+		Expiration:  credentials.SdkCompliantExpirationTime{Time: time.Now().Add(6 * time.Hour)},
+	}
+
+	tests := []struct {
+		name        string
+		auth        *stubRetriever
+		imds        *stubRetriever
+		wantEvicted bool
+	}{
+		{
+			name: "Auth irrecoverable + IMDS absent → evict",
+			auth: &stubRetriever{
+				name:          "eks-auth",
+				err:           irrecoverableAuthErr,
+				irrecoverable: true,
+			},
+			imds: &stubRetriever{
+				name:          "imds",
+				err:           imdsAbsentErr,
+				irrecoverable: true,
+			},
+			wantEvicted: true,
+		},
+		{
+			name: "Auth irrecoverable + IMDS has cred → keep (renewed with IMDS cred)",
+			auth: &stubRetriever{
+				name:          "eks-auth",
+				err:           irrecoverableAuthErr,
+				irrecoverable: true,
+			},
+			imds: &stubRetriever{
+				name: "imds",
+				cred: imdsCred,
+				meta: credentials.CredentialMetadata{CredSource: credentials.SourceIMDS},
+			},
+			wantEvicted: false,
+		},
+		{
+			name: "Auth recoverable + IMDS absent → keep (retry later)",
+			auth: &stubRetriever{
+				name:          "eks-auth",
+				err:           recoverableAuthErr,
+				irrecoverable: false,
+			},
+			imds: &stubRetriever{
+				name:          "imds",
+				err:           imdsAbsentErr,
+				irrecoverable: true,
+			},
+			wantEvicted: false,
+		},
+		{
+			name: "Auth recoverable + IMDS has cred → keep (renewed with IMDS cred)",
+			auth: &stubRetriever{
+				name:          "eks-auth",
+				err:           recoverableAuthErr,
+				irrecoverable: false,
+			},
+			imds: &stubRetriever{
+				name: "imds",
+				cred: imdsCred,
+				meta: credentials.CredentialMetadata{CredSource: credentials.SourceIMDS},
+			},
+			wantEvicted: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			podUID := "combined-eviction-pod"
+			token := test.CreateToken(t, test.TokenConfig{
+				Expiry: time.Now().Add(time.Hour),
+				Iat:    time.Now(),
+				Nbf:    time.Now(),
+				PodUID: podUID,
+			})
+
+			// Wire a real chainedRetriever with stub delegates.
+			chain := NewChainedRetriever(tc.imds, tc.auth)
+
+			retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
+				Delegate:              chain,
+				CredentialsRenewalTtl: 3 * time.Hour,
+				MaxCacheSize:          100,
+				RefreshQPS:            3,
+				CleanupInterval:       0,
+			})
+			retriever.retryInterval = 5 * time.Minute
+			retriever.maxRetryJitter = 1
+
+			// Pre-populate cache with an Auth Service entry that needs renewal.
+			entry := cacheEntry{
+				requestLogCtx: context.Background(),
+				originatingRequest: &credentials.EksCredentialsRequest{
+					ServiceAccountToken: token,
+				},
+				credentials: &credentials.EksCredentialsResponse{
+					AccessKeyId: "AKIA-old-auth",
+					Expiration:  credentials.SdkCompliantExpirationTime{Time: time.Now().Add(30 * time.Second)},
+				},
+				metadata: responseMetadataTest("assoc-orig"),
+			}
+			retriever.internalCache.Add(podUID, entry)
+
+			// Trigger renewal.
+			retriever.onCredentialRenewal(podUID, entry)
+
+			// Assert eviction outcome.
+			_, found := retriever.internalCache.Get(podUID)
+			if tc.wantEvicted {
+				g.Expect(found).To(BeFalse(), "expected entry to be evicted")
+			} else {
+				g.Expect(found).To(BeTrue(), "expected entry to be kept in cache")
+			}
+		})
+	}
+}

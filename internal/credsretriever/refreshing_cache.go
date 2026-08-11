@@ -90,7 +90,7 @@ var (
 	promCacheState = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_identity_cache_state",
 		Help: "The state of credential in cache",
-	}, []string{"state"},
+	}, []string{"state", "source"},
 	)
 
 	promLocalValidation = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -212,7 +212,7 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	defer r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
 
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
-	promCacheState.WithLabelValues("miss").Inc()
+	promCacheState.WithLabelValues("miss", "").Inc()
 
 	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, request)
 	if err != nil {
@@ -402,13 +402,13 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
-			promCacheState.WithLabelValues("hit").Inc()
+			promCacheState.WithLabelValues("hit", string(entry.source())).Inc()
 			return
 		}
 
 		errCode, isIrrecoverableError := r.delegate.IsIrrecoverable(err)
 		if isIrrecoverableError {
-			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
+			log.WithField("source", entry.source()).Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
 			promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
 			podUID, err := getPodUIDfromServiceAccountToken(entry.originatingRequest.ServiceAccountToken)
 			if err != nil {
@@ -453,8 +453,8 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 
 func (r *cachedCredentialRetriever) onCredentialEviction(key string, entry cacheEntry) {
 	log := logger.FromContext(entry.requestLogCtx)
-	log.Infof("Credentials evicted")
-	promCacheState.WithLabelValues("evicted").Inc()
+	log.WithField("source", entry.source()).Infof("Credentials evicted")
+	promCacheState.WithLabelValues("evicted", string(entry.source())).Inc()
 }
 
 func minDuration(a time.Duration, b time.Duration) time.Duration {
