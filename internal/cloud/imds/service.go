@@ -171,7 +171,7 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 	log.WithFields(logrus.Fields{
 		"source":    credentials.SourceIMDS,
 		"namespace": ns,
-	}).Info("Fetched credentials from IMDS")
+	}).Info("Successfully fetched credentials from IMDS")
 
 	return cred, credentials.CredentialMetadata{CredSource: credentials.SourceIMDS}, nil
 }

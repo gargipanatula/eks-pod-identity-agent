@@ -36,7 +36,7 @@ type cachedCredentialRetriever struct {
 	// delegate is who we are actually getting the credentials from
 	delegate credentials.CredentialRetriever
 	// tokenValidator performs local JWT validation when available
-	tokenValidator      atomic.Value // stores tokenValidator interface
+	tokenValidator atomic.Value // stores tokenValidator interface
 	tvInitInFlight atomic.Bool
 	// credentialsRenewalTtl the maximum amount of time that we can hold
 	// credentials in the cache
@@ -193,6 +193,10 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get pod uid from service account token: %w", err)
 	}
+
+	// Bind podUID into the logger context
+	ctx = logger.ContextWithField(ctx, "podUID", podUID)
+	log = logger.FromContext(ctx)
 
 	for i := 0; i <= defaultActiveRequestRetries; i++ {
 		if resp, done := r.tryServingFromCache(ctx, podUID, request); done {
@@ -378,6 +382,9 @@ func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Con
 	}
 	requestLogCtx := logger.ContextWithField(logger.CloneToNewIfPresent(ctx, context.Background()),
 		"association-id", metadata.AssociationId())
+	if podUID, uidErr := getPodUIDfromServiceAccountToken(request.ServiceAccountToken); uidErr == nil {
+		requestLogCtx = logger.ContextWithField(requestLogCtx, "podUID", podUID)
+	}
 	return cacheEntry{
 		originatingRequest: request,
 		requestLogCtx:      requestLogCtx,
@@ -408,7 +415,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 
 		errCode, isIrrecoverableError := r.delegate.IsIrrecoverable(err)
 		if isIrrecoverableError {
-			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
+			log.WithField("source", entry.source()).Infof("Background refresh failed for pod %s: removing credentials from cache (irrecoverable): %v", key, err)
 			promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
 			podUID, err := getPodUIDfromServiceAccountToken(entry.originatingRequest.ServiceAccountToken)
 			if err != nil {
@@ -419,9 +426,9 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			return
 		}
 		promCacheError.WithLabelValues("Recoverable", errCode).Inc()
-		log.Infof("Could not renew, will try to keep existing creds. Error is recoverable: %s", err.Error())
+		log.WithField("source", entry.source()).Infof("Background refresh failed for pod %s: keeping existing credentials in cache (recoverable): %v", key, err)
 	} else {
-		log.Infof("Rate limited! Will try to keep creds locally")
+		log.Infof("Background refresh rate limited for pod %s: keeping credentials locally", key)
 	}
 
 	// if there was an error, try to keep the old credentials in the agent if they haven't expired
@@ -453,7 +460,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 
 func (r *cachedCredentialRetriever) onCredentialEviction(key string, entry cacheEntry) {
 	log := logger.FromContext(entry.requestLogCtx)
-	log.Infof("Credentials evicted")
+	log.WithField("source", entry.source()).Infof("Credentials evicted from cache")
 	promCacheState.WithLabelValues("evicted").Inc()
 }
 

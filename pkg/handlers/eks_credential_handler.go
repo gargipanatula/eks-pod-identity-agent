@@ -121,6 +121,14 @@ func (h *EksCredentialHandler) HandleRequest(resp http.ResponseWriter, req *http
 		RequestTargetHost:   req.Host,
 	}
 
+	// Bind podUID into the logger context
+	if podUID, uidErr := credentials.GetPodUIDFromToken(eksCredentialsRequest.ServiceAccountToken); uidErr != nil {
+		log.Infof("could not extract podUID from token for log context: %v", uidErr)
+	} else {
+		ctx = logger.ContextWithField(ctx, "podUID", podUID)
+		log = logger.FromContext(ctx)
+	}
+
 	creds, err := h.GetEksCredentials(ctx, eksCredentialsRequest)
 	if err != nil {
 		msg, code := errors.HandleCredentialFetchingError(ctx, err)
