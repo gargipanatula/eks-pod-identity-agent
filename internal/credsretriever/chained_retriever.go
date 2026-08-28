@@ -26,12 +26,13 @@ const expirationSkew = 5 * time.Minute
 // delegate's own classifier.
 var ErrAllDelegatesIrrecoverable = errors.New("chained retriever: all delegates returned irrecoverable errors")
 
-// chainedRetriever tries delegates in order and returns the first unexpired credential.
-// If only expired credentials are available, the topmost (first) is returned.
-// If no delegate returns a credential, the joined errors from all delegates are returned.
-// If no delegate returns a credential and every delegate's error is irrecoverable
-// per its own IsIrrecoverable classifier, the returned error wraps
-// ErrAllDelegatesIrrecoverable.
+// chainedRetriever queries its delegates in order and picks a result by this
+// priority:
+//   1. The first unexpired credential returned by any delegate.
+//   2. Otherwise, the first (topmost) expired credential, if any.
+//   3. Otherwise, an error joining every delegate's failure. When every
+//      delegate failed and each classified its own error as irrecoverable
+//      (via IsIrrecoverable), that error wraps ErrAllDelegatesIrrecoverable.
 type chainedRetriever struct {
 	delegates []credentials.CredentialRetriever
 }
