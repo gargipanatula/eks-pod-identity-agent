@@ -116,7 +116,7 @@ func (s *service) String() string { return "imds" }
 //
 // ErrPodNotInMapping (irrecoverable): the pod is absent from the agent's
 // namespaceMapping. The mapping is refreshed every 60s in the background,
-// and credentials are delivered to IMDS within ~15 minutes of pod creation.
+// and credentials are delivered to IMDS within ~30 minutes of pod creation.
 // By the time a cache entry is eligible for refresh (hours), the mapping has
 // long since converged. If the pod is absent at refresh time, it has been
 // deleted or its association removed — eviction is correct.

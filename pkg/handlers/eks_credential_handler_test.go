@@ -21,6 +21,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	imdscloud "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
@@ -126,7 +127,7 @@ func TestEksCredentialHandler_GetIamCredentialsHandler(t *testing.T) {
 	}
 }
 
-func TestBuildCredentialChain_IMDSPresent_ReturnsIMDSThenFallsBack(t *testing.T) {
+func TestCredentialChain_IMDSPresent_ReturnsIMDSThenFallsBack(t *testing.T) {
 	// Verifies the chain ordering using gomock mocks for both delegates.
 	// IMDS has the pod → returns IMDS cred. IMDS misses → falls back to eksauth.
 	imdsCred := &credentials.EksCredentialsResponse{
@@ -150,7 +151,7 @@ func TestBuildCredentialChain_IMDSPresent_ReturnsIMDSThenFallsBack(t *testing.T)
 	mockIMDS.EXPECT().String().Return("imds").AnyTimes()
 	mockAuth.EXPECT().String().Return("auth").AnyTimes()
 
-	handler := chainTestHandler(buildCredentialChain(mockIMDS, mockAuth))
+	handler := chainTestHandler(credsretriever.NewChainedRetriever(mockIMDS, mockAuth))
 	cred, err := handler.GetEksCredentials(context.Background(), req)
 	require.NoError(t, err)
 	assert.Equal(t, "AKIA-IMDS", cred.AccessKeyId)
@@ -169,47 +170,11 @@ func TestBuildCredentialChain_IMDSPresent_ReturnsIMDSThenFallsBack(t *testing.T)
 		Return(authCred, credentials.CredentialMetadata{Association: "a-1", CredSource: credentials.SourceAuthService}, nil)
 	mockAuth2.EXPECT().String().Return("auth").AnyTimes()
 
-	handler.CredentialRetriever = buildCredentialChain(mockIMDS2, mockAuth2)
+	handler.CredentialRetriever = credsretriever.NewChainedRetriever(mockIMDS2, mockAuth2)
 	cred, err = handler.GetEksCredentials(context.Background(), req)
 	require.NoError(t, err)
 	assert.Equal(t, "AKIA-AUTH", cred.AccessKeyId)
 	assert.Equal(t, "222222222222", cred.AccountId)
-}
-
-func TestBuildCredentialChain_NoIMDS_ReturnsAuthService(t *testing.T) {
-	// Verifies that buildCredentialChain returns eksauth creds when IMDS is
-	// absent from the chain, including when nils are passed (IMDS probe fails).
-	tests := []struct {
-		name       string
-		retrievers func(auth credentials.CredentialRetriever) []credentials.CredentialRetriever
-	}{
-		{"auth only", func(auth credentials.CredentialRetriever) []credentials.CredentialRetriever {
-			return []credentials.CredentialRetriever{auth}
-		}},
-		{"nils filtered", func(auth credentials.CredentialRetriever) []credentials.CredentialRetriever {
-			return []credentials.CredentialRetriever{nil, auth, nil}
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctrl := gomock.NewController(t)
-			mockAuth := eksauth.NewMockIface(ctrl)
-
-			authCred := &credentials.EksCredentialsResponse{
-				AccessKeyId: "AKIA-AUTH", SecretAccessKey: "s", Token: "t",
-				AccountId: "222222222222", Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(6 * time.Hour)},
-			}
-			mockAuth.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
-				Return(authCred, credentials.CredentialMetadata{Association: "a-1", CredSource: credentials.SourceAuthService}, nil)
-			mockAuth.EXPECT().String().Return("auth").AnyTimes()
-
-			handler := chainTestHandler(buildCredentialChain(tt.retrievers(mockAuth)...))
-			cred, err := handler.GetEksCredentials(context.Background(), chainTestRequest(t, "pod-1"))
-			require.NoError(t, err)
-			assert.Equal(t, "AKIA-AUTH", cred.AccessKeyId)
-			assert.Equal(t, "222222222222", cred.AccountId)
-		})
-	}
 }
 
 func TestNewEksCredentialHandler_IMDSDisabled_UsesAuthServiceOnly(t *testing.T) {
@@ -288,8 +253,13 @@ func TestEndToEnd_CredentialChain_ReturnsCorrectSource(t *testing.T) {
 					Return(authCred, authMeta, nil)
 			}
 
-			// Create chained retriever
-			handler := chainTestHandler(buildCredentialChain(imdsSvc, mockAuth))
+			// Build the delegate the same way the handler does: chain when IMDS
+			// is present, otherwise eksauth alone.
+			var delegate credentials.CredentialRetriever = mockAuth
+			if imdsSvc != nil {
+				delegate = credsretriever.NewChainedRetriever(imdsSvc, mockAuth)
+			}
+			handler := chainTestHandler(delegate)
 			cred, err := handler.GetEksCredentials(ctx, chainTestRequest(t, tt.requestPodUID))
 
 			require.NoError(t, err)
