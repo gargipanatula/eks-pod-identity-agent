@@ -96,12 +96,13 @@ func createServers(cfg aws.Config) []*server.Server {
 	for i, ip := range bindHosts {
 		addr := fmt.Sprintf("%s:%d", ip, serverPort)
 		servers[i] = server.NewEksCredentialServer(addr, handlers.EksCredentialHandlerOpts{
-			Cfg:               cfg,
-			ClusterName:       clusterName,
-			CredentialRenewal: maxCredentialRenewal,
-			MaxCacheSize:      maxCacheSize,
-			RefreshQPS:        refreshQps,
-			EnableIMDS:        enableIMDSCredentials,
+			Cfg:                cfg,
+			ClusterName:        clusterName,
+			CredentialRenewal:  maxCredentialRenewal,
+			MaxCacheSize:       maxCacheSize,
+			RefreshQPS:         refreshQps,
+			EndpointOverridden: overrideEksAuthEndpoint != "",
+			EnableIMDS:         enableIMDSCredentials,
 		})
 	}
 
