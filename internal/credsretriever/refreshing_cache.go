@@ -435,6 +435,8 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		calculatedRetryInterval := r.retryInterval + time.Duration(rand.Int63n(int64(r.maxRetryJitter)))
 
 		var newRefreshTtl, newEvictionTtl time.Duration
+		// When IMDS is disabled no credential carries SourceIMDS, so this always
+		// takes the else branch
 		if entry.source() == credentials.SourceIMDS {
 			newRefreshTtl = calculatedRetryInterval
 			newEvictionTtl = expiring.NoExpiration
