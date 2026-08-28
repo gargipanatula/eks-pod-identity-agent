@@ -59,9 +59,14 @@ func (r *rateLimitedHTTPClient) Do(req *http.Request) (*http.Response, error) {
 //go:generate mockgen.sh imds $GOFILE
 
 type Iface interface {
+	// GetIamCredentials fetches a pod's credentials from IMDS, or errors so the
+	// chain falls through to the next delegate.
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
+	// String returns the delegate's name for logging and metrics.
 	String() string
+	// IsIrrecoverable reports whether an error means the credential is gone/invalid
+	// (so the cache should stop retrying), returning a code and true if so.
 	IsIrrecoverable(err error) (string, bool)
 }
 
@@ -112,6 +117,7 @@ func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Option
 	return s
 }
 
+// String returns the delegate's name for logging and metrics.
 func (s *service) String() string { return "imds" }
 
 // IsIrrecoverable classifies IMDS errors for the cache's eviction decision.

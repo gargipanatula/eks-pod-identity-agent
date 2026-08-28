@@ -18,9 +18,13 @@ import (
 //go:generate mockgen.sh eksauth $GOFILE
 
 type Iface interface {
+	// GetIamCredentials fetches IAM credentials for a pod from EKS Auth.
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
+	// String returns the delegate's name for logging and metrics.
 	String() string
+	// IsIrrecoverable reports whether an error means the credential is gone/invalid
+	// (so the cache should stop retrying), returning a code and true if so.
 	IsIrrecoverable(err error) (string, bool)
 }
 
@@ -52,12 +56,15 @@ func (r responseMetadata) AssociationId() string {
 	return string(r)
 }
 
+// Source identifies credentials from this delegate as coming from the Auth Service.
 func (r responseMetadata) Source() credentials.CredentialSource {
 	return credentials.SourceAuthService
 }
 
+// String returns the delegate's name for logging and metrics.
 func (s *service) String() string { return "eks-auth" }
 
+// IsIrrecoverable classifies an EKS Auth API error as irrecoverable or transient.
 func (s *service) IsIrrecoverable(err error) (string, bool) {
 	return IsIrrecoverableApiError(err)
 }
