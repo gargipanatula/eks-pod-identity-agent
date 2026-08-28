@@ -24,7 +24,6 @@ type Iface interface {
 	// String returns the delegate's name for logging and metrics.
 	String() string
 	// IsIrrecoverable reports whether an error means the credential is gone/invalid
-	// (so the cache should stop retrying), returning a code and true if so.
 	IsIrrecoverable(err error) (string, bool)
 }
 

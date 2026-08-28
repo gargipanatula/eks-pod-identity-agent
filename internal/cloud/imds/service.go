@@ -1,6 +1,4 @@
-// Package imds implements the IMDS credential delegate for EKS Pod Identity.
-//
-// Pod credentials are delivered to EC2 IMDS under numbered namespaces at
+// Pod credentials can be delivered to EC2 IMDS under numbered namespaces at
 // /latest/meta-data/. Each namespace holds up to 200 pods, spread across
 // iam-eks-1 .. iam-eks-N:
 //
@@ -14,12 +12,11 @@
 //	│   ├── info
 //	│   └── security-credentials/
 //	│       └── ...
-//	├── iam                               # EC2 instance role (not EKS)
+//	├── iam
 //	├── placement
 //	└── ...
 //
-// The number of namespaces is dynamic and pods may be reshuffled across namespaces on each renewal. Namespaces are
-// discovered by listing the metadata root and filtering for the iam-eks-* prefix.
+// The number of namespaces is dynamic and pods may be reshuffled across namespaces on each renewal.
 package imds
 
 import (
@@ -36,14 +33,14 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/sirupsen/logrus"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	"golang.org/x/time/rate"
 )
 
-// rateLimitedHTTPClient wraps an http.Client with a rate limiter so that all
-// IMDS requests are throttled transparently.
+// adds rate limiting to a standard http client
 type rateLimitedHTTPClient struct {
 	client  *http.Client
 	limiter *rate.Limiter
@@ -56,17 +53,13 @@ func (r *rateLimitedHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	return r.client.Do(req)
 }
 
-//go:generate mockgen.sh imds $GOFILE
-
 type Iface interface {
-	// GetIamCredentials fetches a pod's credentials from IMDS, or errors so the
-	// chain falls through to the next delegate.
+	// GetIamCredentials fetches a pod's credentials from IMDS
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
-	// String returns the delegate's name for logging and metrics.
+	// String returns the delegate's name
 	String() string
 	// IsIrrecoverable reports whether an error means the credential is gone/invalid
-	// (so the cache should stop retrying), returning a code and true if so.
 	IsIrrecoverable(err error) (string, bool)
 }
 
@@ -79,16 +72,13 @@ const (
 
 type service struct {
 	imdsClient *imds.Client
-	// nsMapping stores map[string]string (podUID → namespace).
+	// nsMapping maps podUIDs to IMDS namespaces
 	nsMapping atomic.Value
 }
 
 func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Options)) Iface {
-	// The IMDS SDK enforces a default 5-second timeout per operation. We tighten
-	// this to 1s total / 500ms socket connect to match eksauth's config. The client
-	// is rate-limited to 20 TPS to protect other critical processes on the instance
-	// that call IMDS.
-	// https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/feature/ec2/imds#Options
+	// Set a 1 second timeout per IMDS request, and rate limit to 20 TPS to avoid
+	// heavy loads triggering throttling of other node processes that use IMD.
 	httpClient := &rateLimitedHTTPClient{
 		client: &http.Client{
 			Transport: &http.Transport{
@@ -108,6 +98,8 @@ func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Option
 	}
 	s.nsMapping.Store(map[string]string{})
 
+	// Build a mapping of pods to namespaces, enabling easy lookup when fetching credentials for a pod.
+	// This mapping is refreshed every 60s in the background.
 	log := logger.FromContext(ctx)
 	if err := s.buildNamespaceMapping(ctx); err != nil {
 		log.Warnf("Initial IMDS namespace mapping build failed: %v", err)
@@ -126,8 +118,8 @@ func (s *service) String() string { return "imds" }
 // namespaceMapping. The mapping is refreshed every 60s in the background,
 // and credentials are delivered to IMDS within ~15 minutes of pod creation.
 // By the time a cache entry is eligible for refresh (hours), the mapping has
-// long since converged. If the pod is absent at refresh time, it has genuinely
-// been deleted or its association removed — eviction is correct.
+// long since converged. If the pod is absent at refresh time, it has been
+// deleted or its association removed — eviction is correct.
 //
 // ErrCredentialNotFound (recoverable): the pod IS in the mapping but IMDS
 // returned 404 for the credential itself. This can happen transiently when
@@ -152,23 +144,27 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 		return nil, nil, fmt.Errorf("IMDS delegate: %w", err)
 	}
 
-	ns, found := s.lookupNamespace(podUID)
+	// See if the pod has a credential in IMDS
+	ns, found := s.nsMapping.Load().(map[string]string)[podUID]
 	if !found {
-		// The namespace mapping is refreshed in the background every 60s and
-		// is not refreshed on demand here. A miss means the pod's credentials
-		// were delivered to IMDS between background refresh cycles. On-demand
-		// refresh could close this race, but would need a cooldown to prevent
-		// bursty workloads from hitting the IMDS rate limit — and delivery
-		// during that cooldown recreates the same gap. Background-only refresh
-		// is simpler and bounds IMDS call volume predictably.
+		// The namespace mapping only refreshes in the background (every 60s), so a
+		// miss is possible even when credentials do exist in IMDS. The race:
+		//   t=0  pod receives creds via the sync path
+		//   t=1  EKS Auth Service goes down
+		//   t=2  agent restarts, clearing its cached creds
+		//   t=3  creds are placed in IMDS
+		//   t=4  pod requests creds, but the mapping hasn't refreshed yet, so the
+		//        agent doesn't see the podUID and returns an error
 		//
-		// This scenario is unlikely: it requires the agent to restart in the
-		// narrow window between a pod first receiving credentials via the sync
-		// path and those credentials being placed into IMDS. When wired behind
-		// a chained retriever, the retriever will fallback to eksauth.
+		// This is unlikely: SDKs refresh credentials close to expiry (hours away),
+		// while the mapping converges within a minute. The alternative — refreshing
+		// on demand — could overload IMDS under bursty workloads and throttle other
+		// critical processes on the node. Behind the chained retriever, this miss
+		// simply falls through to EKS Auth.
 		return nil, nil, ErrPodNotInMapping
 	}
 
+	// If so, get the credential
 	cred, err := s.readCredential(ctx, ns, podUID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("IMDS delegate: %w", err)
@@ -182,8 +178,7 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 	return cred, credentials.CredentialMetadata{CredSource: credentials.SourceIMDS}, nil
 }
 
-// startBackgroundRefresh starts a goroutine that refreshes the namespace
-// mapping at the given interval. Failures log a warning but keep the old map.
+// startBackgroundRefresh starts a goroutine that refreshes the namespace mapping
 func (s *service) startBackgroundRefresh(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -193,6 +188,7 @@ func (s *service) startBackgroundRefresh(ctx context.Context, interval time.Dura
 			case <-ticker.C:
 				if err := s.buildNamespaceMapping(ctx); err != nil {
 					log := logger.FromContext(ctx)
+					// any failures log a warning but keep the old map
 					log.Warnf("IMDS namespace mapping refresh failed, keeping old map: %v", err)
 				}
 			case <-ctx.Done():
@@ -207,18 +203,22 @@ func (s *service) startBackgroundRefresh(ctx context.Context, interval time.Dura
 func (s *service) buildNamespaceMapping(ctx context.Context) error {
 	log := logger.FromContext(ctx)
 
+	// Determine what namespaces exist (number is not guaranteed)
 	namespaces, err := s.discoverNamespaces(ctx)
 	if err != nil {
 		return fmt.Errorf("building namespace mapping: %w", err)
 	}
 
+	// Create the new mapping
 	newMap := make(map[string]string)
 	for _, ns := range namespaces {
+		// Read the info file, which lists the pods in the namespace
 		info, err := s.readNamespaceInfo(ctx, ns)
 		if err != nil {
 			log.WithField("namespace", ns).Warnf("Failed to read namespace info, skipping: %v", err)
 			continue
 		}
+		// Iterate through each pod and map it to the namespace
 		for podUID, entry := range info.PodCredentials {
 			if !strings.EqualFold(entry.Code, "Success") {
 				log.WithFields(logrus.Fields{"namespace": ns, "podUID": podUID, "code": entry.Code}).
@@ -232,13 +232,6 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 	s.nsMapping.Store(newMap)
 	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces", len(newMap), len(namespaces))
 	return nil
-}
-
-// lookupNamespace returns the IMDS namespace for a pod UID, or false if not mapped.
-func (s *service) lookupNamespace(podUID string) (string, bool) {
-	m := s.nsMapping.Load().(map[string]string)
-	ns, ok := m[podUID]
-	return ns, ok
 }
 
 // getMetadata fetches a metadata path from IMDS.
@@ -299,4 +292,26 @@ func (s *service) discoverNamespaces(ctx context.Context) ([]string, error) {
 		}
 	}
 	return namespaces, nil
+}
+
+// ProbeIMDS checks whether IMDS is available on this node using Option C
+// (accept 200 or 429). A 200 means IMDS is healthy; a 429 means IMDS is
+// present but throttling. Any other result (transport error, 404 from a
+// metadata proxy, etc.) is treated as "IMDS not available."
+func ProbeIMDS(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Options)) bool {
+	log := logger.FromContext(ctx)
+
+	client := imds.NewFromConfig(cfg, optFns...)
+	_, err := client.GetMetadata(ctx, &imds.GetMetadataInput{Path: "instance-id"})
+
+	var respErr *smithyhttp.ResponseError
+	available := err == nil ||
+		(errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusTooManyRequests)
+
+	if available {
+		log.Info("IMDS probe succeeded, IMDS is available on this node")
+	} else {
+		log.Info("IMDS probe failed, IMDS is not available on this node")
+	}
+	return available
 }
