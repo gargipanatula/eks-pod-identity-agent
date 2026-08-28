@@ -49,17 +49,6 @@ func NewService(cfg aws.Config) Iface {
 	}
 }
 
-type responseMetadata string
-
-func (r responseMetadata) AssociationId() string {
-	return string(r)
-}
-
-// Source identifies credentials from this delegate as coming from the Auth Service.
-func (r responseMetadata) Source() credentials.CredentialSource {
-	return credentials.SourceAuthService
-}
-
 // String returns the delegate's name for logging and metrics.
 func (s *service) String() string { return "eks-auth" }
 
@@ -105,5 +94,8 @@ func (s *service) GetIamCredentials(ctx context.Context,
 		Token:           *creds.Credentials.SessionToken,
 		AccountId:       parsedArn.AccountID,
 		Expiration:      credentials.SdkCompliantExpirationTime{Time: *creds.Credentials.Expiration},
-	}, responseMetadata(*creds.PodIdentityAssociation.AssociationId), nil
+	}, credentials.CredentialMetadata{
+		Association: *creds.PodIdentityAssociation.AssociationId,
+		CredSource:  credentials.SourceAuthService,
+	}, nil
 }

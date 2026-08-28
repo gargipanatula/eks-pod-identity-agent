@@ -199,7 +199,7 @@ func TestGetIamCredentials(t *testing.T) {
 				return httpResponse(tt.credCode, tt.credBody), nil
 			})
 			// Pre-populate the namespace mapping (bypasses discovery).
-			svc.nsMapping.Store(tt.mapping)
+			svc.storeMapping(tt.mapping)
 
 			// Build the request — use raw token if provided, otherwise generate a valid JWT.
 			var request *credentials.EksCredentialsRequest
@@ -402,7 +402,7 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			require.NoError(t, svc.buildNamespaceMapping(testCtx()))
 
 			// Total map size, then each expected pod resolves to its namespace.
-			assert.Len(t, svc.nsMapping.Load().(map[string]string), tt.wantPods)
+			assert.Len(t, svc.loadMapping(), tt.wantPods)
 			for podUID, wantNS := range tt.wantLookups {
 				ns, ok := lookupNamespace(svc, podUID)
 				assert.True(t, ok, "expected pod %s in mapping", podUID)
@@ -442,7 +442,7 @@ func TestNamespaceMapping_BackgroundRefresh_UpdatesMap(t *testing.T) {
 
 	// Initial build sees only pod-old.
 	require.NoError(t, svc.buildNamespaceMapping(ctx))
-	assert.Len(t, svc.nsMapping.Load().(map[string]string), 1)
+	assert.Len(t, svc.loadMapping(), 1)
 
 	// Background refresh picks up pod-new after the ticker fires.
 	svc.startBackgroundRefresh(ctx, 50*time.Millisecond)
@@ -450,7 +450,7 @@ func TestNamespaceMapping_BackgroundRefresh_UpdatesMap(t *testing.T) {
 	cancel()
 
 	// Verify the map was updated with the new pod.
-	assert.Len(t, svc.nsMapping.Load().(map[string]string), 2)
+	assert.Len(t, svc.loadMapping(), 2)
 	_, ok := lookupNamespace(svc, "pod-new")
 	assert.True(t, ok)
 }
@@ -550,7 +550,7 @@ func newTestService(handler func(*http.Request) (*http.Response, error)) *servic
 	s := &service{
 		imdsClient: imdsClient,
 	}
-	s.nsMapping.Store(map[string]string{})
+	s.storeMapping(map[string]string{})
 	return s
 }
 
@@ -607,7 +607,7 @@ func fakeRequest(t *testing.T, podUID string) *credentials.EksCredentialsRequest
 // lookupNamespace reads the podUID→namespace entry from the service's mapping.
 // A test-only helper mirroring the inline lookup in GetIamCredentials.
 func lookupNamespace(s *service, podUID string) (string, bool) {
-	ns, ok := s.nsMapping.Load().(map[string]string)[podUID]
+	ns, ok := s.loadMapping()[podUID]
 	return ns, ok
 }
 

@@ -354,6 +354,8 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 //   - Auth Service/Default: remaining TTL must exceed minCredentialTtl.
 func (r *cachedCredentialRetriever) credentialsInEntryWithinValidTtl(entry cacheEntry) (time.Duration, bool) {
 	if entry.source() == credentials.SourceIMDS {
+		// IMDS creds are always "valid": return the refresh interval as the
+		// duration (not a real remaining TTL) so callers never treat them as expired.
 		return imdsRefreshInterval, true
 	}
 	// Default: Auth Service policy — credentials must have remaining TTL > minCredentialTtl.
@@ -435,8 +437,8 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		calculatedRetryInterval := r.retryInterval + time.Duration(rand.Int63n(int64(r.maxRetryJitter)))
 
 		var newRefreshTtl, newEvictionTtl time.Duration
-		// When IMDS is disabled no credential carries SourceIMDS, so this always
-		// takes the else branch
+		// IMDS creds never expire (static stability); Auth creds expire with
+		// the credential.
 		if entry.source() == credentials.SourceIMDS {
 			newRefreshTtl = calculatedRetryInterval
 			newEvictionTtl = expiring.NoExpiration

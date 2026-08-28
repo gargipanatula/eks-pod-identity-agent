@@ -20,6 +20,8 @@
 package imds
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -73,7 +75,20 @@ const (
 type service struct {
 	imdsClient *imds.Client
 	// nsMapping maps podUIDs to IMDS namespaces
-	nsMapping atomic.Value
+	nsMapping atomic.Pointer[map[string]string]
+}
+
+// loadMapping returns the current podUID→namespace mapping.
+func (s *service) loadMapping() map[string]string {
+	if m := s.nsMapping.Load(); m != nil {
+		return *m
+	}
+	return nil
+}
+
+// storeMapping atomically replaces the podUID→namespace mapping.
+func (s *service) storeMapping(m map[string]string) {
+	s.nsMapping.Store(&m)
 }
 
 func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Options)) Iface {
@@ -96,7 +111,7 @@ func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Option
 	s := &service{
 		imdsClient: imds.NewFromConfig(cfg, opts...),
 	}
-	s.nsMapping.Store(map[string]string{})
+	s.storeMapping(map[string]string{})
 
 	// Build a mapping of pods to namespaces, enabling easy lookup when fetching credentials for a pod.
 	// This mapping is refreshed every 60s in the background.
@@ -145,7 +160,8 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 	}
 
 	// See if the pod has a credential in IMDS
-	ns, found := s.nsMapping.Load().(map[string]string)[podUID]
+	ns, found := s.loadMapping()[podUID]
+	log.WithFields(logrus.Fields{"podUID": podUID, "found": found, "namespace": ns}).Info("IMDS delegate namespace lookup")
 	if !found {
 		// The namespace mapping only refreshes in the background (every 60s), so a
 		// miss is possible even when credentials do exist in IMDS. The race:
@@ -229,10 +245,15 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 		}
 	}
 
-	s.nsMapping.Store(newMap)
-	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces", len(newMap), len(namespaces))
+	s.storeMapping(newMap)
+	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces (%v)", len(newMap), len(namespaces), namespaces)
 	return nil
 }
+
+// maxMetadataBytes caps how much we read from any single IMDS response.
+// IMDS info/credential files are a few KB; 1 MiB is generous headroom while
+// bounding memory if a misbehaving metadata proxy returns an unbounded body.
+const maxMetadataBytes = 1 << 20
 
 // getMetadata fetches a metadata path from IMDS.
 func (s *service) getMetadata(ctx context.Context, path string) ([]byte, error) {
@@ -241,7 +262,7 @@ func (s *service) getMetadata(ctx context.Context, path string) ([]byte, error) 
 		return nil, err
 	}
 	defer out.Content.Close()
-	return io.ReadAll(out.Content)
+	return io.ReadAll(io.LimitReader(out.Content, maxMetadataBytes))
 }
 
 // readNamespaceInfo reads and parses the JSON info file for a given namespace.
@@ -285,8 +306,9 @@ func (s *service) discoverNamespaces(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("listing IMDS metadata root: %w", err)
 	}
 	var namespaces []string
-	for _, entry := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		entry = strings.TrimRight(entry, "/")
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		entry := strings.TrimRight(scanner.Text(), "/")
 		if strings.HasPrefix(entry, iamEKSPrefix) {
 			namespaces = append(namespaces, strings.TrimPrefix(entry, iamEKSPrefix))
 		}

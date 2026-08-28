@@ -20,7 +20,6 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
-	imdscloud "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
@@ -239,7 +238,7 @@ func TestEndToEnd_CredentialChain_ReturnsCorrectSource(t *testing.T) {
 			// Build IMDS delegate with fake HTTP backend, or nil if IMDS is down.
 			var imdsSvc credentials.CredentialRetriever
 			if tt.imdsPods != nil {
-				imdsSvc = imdscloud.NewService(ctx, aws.Config{}, func(o *sdkimds.Options) {
+				imdsSvc = imds.NewService(ctx, aws.Config{}, func(o *sdkimds.Options) {
 					o.HTTPClient = &fakeHTTPClient{handler: &fakeIMDSHandler{pods: tt.imdsPods}}
 					o.ClientEnableState = sdkimds.ClientEnabled
 				})

@@ -69,6 +69,7 @@ func (c *chainedRetriever) GetIamCredentials(ctx context.Context,
 		if d == nil {
 			continue
 		}
+		log.WithField("delegate", d.String()).Info("attempting delegate")
 		cred, meta, err := d.GetIamCredentials(ctx, request)
 
 		// Delegate failed — log and try the next one.
@@ -83,7 +84,7 @@ func (c *chainedRetriever) GetIamCredentials(ctx context.Context,
 
 		// Got an unexpired credential — return immediately.
 		if cred.Expiration.Time.After(time.Now().Add(expirationSkew)) {
-			log.WithFields(logrus.Fields{"delegate": d.String(), "expiry": cred.Expiration.Time.Format(time.RFC3339)}).Info("Returning credential")
+			log.WithFields(logrus.Fields{"delegate": d.String(), "expiry": cred.Expiration.Time.Format(time.RFC3339)}).Info("Returning unexpired credential from delegate")
 			promChainedResult.WithLabelValues(d.String(), "unexpired").Inc()
 			return cred, meta, nil
 		}
@@ -97,7 +98,7 @@ func (c *chainedRetriever) GetIamCredentials(ctx context.Context,
 	}
 
 	if bestCred != nil {
-		log.WithFields(logrus.Fields{"delegate": bestDelegate, "expiry": bestCred.Expiration.Time.Format(time.RFC3339), "expired": true}).Info("Returning fallback credential")
+		log.WithFields(logrus.Fields{"delegate": bestDelegate, "expiry": bestCred.Expiration.Time.Format(time.RFC3339), "expired": true}).Info("Returning fallback (expired) credential from delegate")
 		promChainedResult.WithLabelValues(bestDelegate, "expired").Inc()
 		return bestCred, bestMeta, nil
 	}

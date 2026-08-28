@@ -55,17 +55,23 @@ func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandle
 	// exactly as it did before this feature: a single eksauth delegate, no IMDS
 	// probe, no chain. Only when enabled (and IMDS is actually available on the
 	// node) do we build the [IMDS, eksauth] chain.
+	log := logger.FromContext(context.Background())
+	log.Infof("Wiring credential retriever: EnableIMDS flag = %t", opts.EnableIMDS)
 	if opts.EnableIMDS {
 		ctx := logger.ContextWithField(context.Background(), "cluster-name", opts.ClusterName)
 		if imdscloud.ProbeIMDS(ctx, opts.Cfg) {
+			log.Info("IMDS available and picked up: building [imds, eksauth] chained retriever")
 			imdsSvc := imdscloud.NewService(ctx, opts.Cfg)
 			credentialsRetriever = credsretriever.NewChainedRetriever(imdsSvc, credentialsRetriever)
+		} else {
+			log.Info("IMDS NOT available on node: falling back to eksauth-only (no chain)")
 		}
+	} else {
+		log.Info("IMDS disabled by flag: using eksauth-only retriever (no chain)")
 	}
 
 	tv, err := validation.NewTokenValidator(context.Background())
 	if err != nil {
-		log := logger.FromContext(context.Background())
 		log.Infof("failed to initialize token validator: %v", err)
 	}
 	if tv != nil {
