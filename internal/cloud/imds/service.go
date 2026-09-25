@@ -166,6 +166,7 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 
 	// See if the pod has a credential in IMDS
 	ns, found := s.loadMapping()[podUID]
+	log.WithFields(logrus.Fields{"podUID": podUID, "found": found, "namespace": ns}).Info("IMDS delegate namespace lookup")
 	if !found {
 		// The namespace mapping only refreshes in the background (every 60s), so a
 		// miss is possible even when credentials do exist in IMDS. The race:
@@ -239,17 +240,40 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 			log.WithField("namespace", fullNS).Warnf("Failed to read namespace info, skipping: %v", err)
 			continue
 		}
-		// Map each pod with a success code to its namespace.
+		// Iterate through each pod and map it to the namespace
+		var success, skipped int
 		for podUID, code := range info.PodCredentials {
 			if code != credentials.PodCredentialSuccessCode {
+				log.WithFields(logrus.Fields{"namespace": fullNS, "podUID": podUID, "code": code}).
+					Info("Skipping pod with non-success code")
+				skipped++
 				continue
 			}
+			log.WithFields(logrus.Fields{"namespace": fullNS, "podUID": podUID, "code": code}).
+				Info("Mapped pod to namespace")
 			newMap[podUID] = ns
+			success++
 		}
+		log.WithFields(logrus.Fields{
+			"namespace":   fullNS,
+			"code":        info.Code,
+			"lastUpdated": info.LastUpdated,
+			"totalPods":   len(info.PodCredentials),
+			"successPods": success,
+			"skippedPods": skipped,
+		}).Info("Processed IMDS namespace")
 	}
 
 	s.storeMapping(newMap)
-	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces", len(newMap), len(namespaces))
+	fullNames := make([]string, len(namespaces))
+	for i, ns := range namespaces {
+		fullNames[i] = iamEKSPrefix + ns
+	}
+	log.WithFields(logrus.Fields{
+		"pods":       len(newMap),
+		"namespaces": fullNames,
+		"mapping":    newMap,
+	}).Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces (%v)", len(newMap), len(namespaces), fullNames)
 	return nil
 }
 
@@ -270,11 +294,18 @@ func (s *service) getMetadata(ctx context.Context, path string) ([]byte, error) 
 
 // readNamespaceInfo reads and parses the JSON info file for a given namespace.
 func (s *service) readNamespaceInfo(ctx context.Context, namespace string) (*credentials.NamespaceInfo, error) {
+	log := logger.FromContext(ctx)
 	path := iamEKSPrefix + namespace + "/info"
 	data, err := s.getMetadata(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("reading namespace info %s: %w", namespace, err)
 	}
+	log.WithFields(logrus.Fields{
+		"namespace": iamEKSPrefix + namespace,
+		"path":      path,
+		"bytes":     len(data),
+		"rawInfo":   string(data),
+	}).Info("Read IMDS namespace info file")
 	var info credentials.NamespaceInfo
 	if err := json.Unmarshal(data, &info); err != nil {
 		return nil, fmt.Errorf("parsing namespace info %s: %w", namespace, err)
@@ -304,6 +335,7 @@ func (s *service) readCredential(ctx context.Context, namespace, podUID string) 
 // replaces sequential probing, correctly handling non-sequential namespaces
 // and dynamic namespace counts.
 func (s *service) discoverNamespaces(ctx context.Context) ([]string, error) {
+	log := logger.FromContext(ctx)
 	data, err := s.getMetadata(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("listing IMDS metadata root: %w", err)
@@ -316,6 +348,12 @@ func (s *service) discoverNamespaces(ctx context.Context) ([]string, error) {
 			namespaces = append(namespaces, strings.TrimPrefix(entry, iamEKSPrefix))
 		}
 	}
+	log.WithFields(logrus.Fields{
+		"bytes":         len(data),
+		"rawRoot":       string(data),
+		"iamEKSPrefix":  iamEKSPrefix,
+		"matchedSuffix": namespaces,
+	}).Info("Discovered IMDS metadata root")
 	return namespaces, nil
 }
 
